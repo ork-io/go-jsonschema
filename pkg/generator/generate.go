@@ -519,6 +519,9 @@ func (g *schemaGenerator) generateDeclaredType(
 func (g *schemaGenerator) generateType(
 	t *schemas.Type, scope nameScope) (codegen.Type, error) {
 	if ext := t.GoJSONSchemaExtension; ext != nil {
+		for _, pkg := range ext.Imports {
+			g.output.file.Package.AddImport(pkg, "")
+		}
 		if ext.Type != nil {
 			return &codegen.CustomNameType{Type: *ext.Type}, nil
 		}
@@ -585,6 +588,9 @@ func (g *schemaGenerator) generateStructType(
 
 		fieldName := g.identifierize(name)
 		if ext := prop.GoJSONSchemaExtension; ext != nil {
+			for _, pkg := range ext.Imports {
+				g.output.file.Package.AddImport(pkg, "")
+			}
 			if ext.Identifier != nil {
 				fieldName = *ext.Identifier
 			}
@@ -643,6 +649,9 @@ func (g *schemaGenerator) generateTypeInline(
 	scope nameScope) (codegen.Type, error) {
 	if t.Enum == nil && t.Ref == "" {
 		if ext := t.GoJSONSchemaExtension; ext != nil {
+			for _, pkg := range ext.Imports {
+				g.output.file.Package.AddImport(pkg, "")
+			}
 			if ext.Type != nil {
 				return &codegen.CustomNameType{Type: *ext.Type}, nil
 			}
