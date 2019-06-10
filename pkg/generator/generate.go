@@ -660,7 +660,7 @@ func (g *schemaGenerator) generateTypeInline(
 			return codegen.PrimitiveTypeFromJSONSchemaType(t.Type[0])
 		}
 
-		if t.Type[0] == schemas.TypeNameArray {
+		if t.Type[0] == schemas.TypeNameArray && t.Items != nil {
 			theType, err := g.generateTypeInline(t.Items, scope.add("Elem"))
 			if err != nil {
 				return nil, err
