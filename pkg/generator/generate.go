@@ -12,8 +12,8 @@ import (
 
 	"github.com/sanity-io/litter"
 
-	"github.com/atombender/go-jsonschema/pkg/codegen"
-	"github.com/atombender/go-jsonschema/pkg/schemas"
+	"github.com/ork-io/go-jsonschema/pkg/codegen"
+	"github.com/ork-io/go-jsonschema/pkg/schemas"
 )
 
 type Config struct {
@@ -392,107 +392,113 @@ func (g *schemaGenerator) generateDeclaredType(
 		return g.generateEnumType(t, scope)
 	}
 
-	decl := codegen.TypeDecl{
-		Name:    g.output.uniqueTypeName(scope.string()),
-		Comment: t.Description,
-	}
-	g.output.declsBySchema[t] = &decl
-	g.output.declsByName[decl.Name] = &decl
+	var decl *codegen.TypeDecl
 
-	theType, err := g.generateType(t, scope)
-	if err != nil {
-		return nil, err
-	}
-	if isNamedType(theType) {
-		// Don't declare named types under a new name
-		delete(g.output.declsBySchema, t)
-		delete(g.output.declsByName, decl.Name)
-		return theType, nil
-	}
-	decl.Type = theType
-
-	g.output.file.Package.AddDecl(&decl)
-
-	if structType, ok := theType.(*codegen.StructType); ok {
-		var validators []validator
-		for _, f := range structType.RequiredJSONFields {
-			validators = append(validators, &requiredValidator{f})
+	if !g.output.uniqueTypeDuplicate(scope.string()) {
+		decl = &codegen.TypeDecl{
+			Name:    g.output.uniqueTypeName(scope.string()),
+			Comment: t.Description,
 		}
-		for _, f := range structType.Fields {
-			if f.DefaultValue != nil {
-				validators = append(validators, &defaultValidator{
-					jsonName:     f.JSONName,
-					fieldName:    f.Name,
-					defaultValue: litter.Sdump(f.DefaultValue),
-				})
+		g.output.declsBySchema[t] = decl
+		g.output.declsByName[decl.Name] = decl
+
+		theType, err := g.generateType(t, scope)
+		if err != nil {
+			return nil, err
+		}
+		if isNamedType(theType) {
+			// Don't declare named types under a new name
+			delete(g.output.declsBySchema, t)
+			delete(g.output.declsByName, decl.Name)
+			return theType, nil
+		}
+		decl.Type = theType
+
+		g.output.file.Package.AddDecl(decl)
+
+		if structType, ok := theType.(*codegen.StructType); ok {
+			var validators []validator
+			for _, f := range structType.RequiredJSONFields {
+				validators = append(validators, &requiredValidator{f})
 			}
-			if _, ok := f.Type.(codegen.NullType); ok {
-				validators = append(validators, &nullTypeValidator{
-					fieldName: f.Name,
-					jsonName:  f.JSONName,
-				})
-			} else {
-				t, arrayDepth := f.Type, 0
-				for v, ok := t.(*codegen.ArrayType); ok; v, ok = t.(*codegen.ArrayType) {
-					arrayDepth++
-					if _, ok := v.Type.(codegen.NullType); ok {
-						validators = append(validators, &nullTypeValidator{
-							fieldName:  f.Name,
-							jsonName:   f.JSONName,
-							arrayDepth: arrayDepth,
-						})
+			for _, f := range structType.Fields {
+				if f.DefaultValue != nil {
+					validators = append(validators, &defaultValidator{
+						jsonName:     f.JSONName,
+						fieldName:    f.Name,
+						defaultValue: litter.Sdump(f.DefaultValue),
+					})
+				}
+				if _, ok := f.Type.(codegen.NullType); ok {
+					validators = append(validators, &nullTypeValidator{
+						fieldName: f.Name,
+						jsonName:  f.JSONName,
+					})
+				} else {
+					t, arrayDepth := f.Type, 0
+					for v, ok := t.(*codegen.ArrayType); ok; v, ok = t.(*codegen.ArrayType) {
+						arrayDepth++
+						if _, ok := v.Type.(codegen.NullType); ok {
+							validators = append(validators, &nullTypeValidator{
+								fieldName:  f.Name,
+								jsonName:   f.JSONName,
+								arrayDepth: arrayDepth,
+							})
+							break
+						}
+
+						t = v.Type
+					}
+				}
+			}
+
+			if len(validators) > 0 {
+				for _, v := range validators {
+					if v.desc().hasError {
+						g.output.file.Package.AddImport("fmt", "")
 						break
 					}
-
-					t = v.Type
 				}
+
+				g.output.file.Package.AddImport("encoding/json", "")
+				g.output.file.Package.AddDecl(&codegen.Method{
+					Impl: func(out *codegen.Emitter) {
+						out.Comment("UnmarshalJSON implements json.Unmarshaler.")
+						out.Println("func (j *%s) UnmarshalJSON(b []byte) error {", decl.Name)
+						out.Indent(1)
+						out.Println("var %s map[string]interface{}", varNameRawMap)
+						out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }",
+							varNameRawMap)
+						for _, v := range validators {
+							if v.desc().beforeJSONUnmarshal {
+								v.generate(out)
+							}
+						}
+
+						out.Println("type Plain %s", decl.Name)
+						out.Println("var %s Plain", varNamePlainStruct)
+						out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }",
+							varNamePlainStruct)
+
+						for _, v := range validators {
+							if !v.desc().beforeJSONUnmarshal {
+								v.generate(out)
+							}
+						}
+
+						out.Println("*j = %s(%s)", decl.Name, varNamePlainStruct)
+						out.Println("return nil")
+						out.Indent(-1)
+						out.Println("}")
+					},
+				})
 			}
 		}
-
-		if len(validators) > 0 {
-			for _, v := range validators {
-				if v.desc().hasError {
-					g.output.file.Package.AddImport("fmt", "")
-					break
-				}
-			}
-
-			g.output.file.Package.AddImport("encoding/json", "")
-			g.output.file.Package.AddDecl(&codegen.Method{
-				Impl: func(out *codegen.Emitter) {
-					out.Comment("UnmarshalJSON implements json.Unmarshaler.")
-					out.Println("func (j *%s) UnmarshalJSON(b []byte) error {", decl.Name)
-					out.Indent(1)
-					out.Println("var %s map[string]interface{}", varNameRawMap)
-					out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }",
-						varNameRawMap)
-					for _, v := range validators {
-						if v.desc().beforeJSONUnmarshal {
-							v.generate(out)
-						}
-					}
-
-					out.Println("type Plain %s", decl.Name)
-					out.Println("var %s Plain", varNamePlainStruct)
-					out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }",
-						varNamePlainStruct)
-
-					for _, v := range validators {
-						if !v.desc().beforeJSONUnmarshal {
-							v.generate(out)
-						}
-					}
-
-					out.Println("*j = %s(%s)", decl.Name, varNamePlainStruct)
-					out.Println("return nil")
-					out.Indent(-1)
-					out.Println("}")
-				},
-			})
-		}
+	} else {
+		decl = g.output.declsByName[scope.string()]
 	}
 
-	return &codegen.NamedType{Decl: &decl}, nil
+	return &codegen.NamedType{Decl: decl}, nil
 }
 
 func (g *schemaGenerator) generateType(
@@ -717,80 +723,86 @@ func (g *schemaGenerator) generateEnumType(
 		}
 	}
 
-	enumDecl := codegen.TypeDecl{
-		Name: g.output.uniqueTypeName(scope.string()),
-		Type: enumType,
-	}
-	g.output.file.Package.AddDecl(&enumDecl)
+	// ENUM duplicates end up duplicates
+	var enumDecl *codegen.TypeDecl
+	if !g.output.uniqueTypeDuplicate(scope.string()) {
+		enumDecl = &codegen.TypeDecl{
+			Name: g.output.uniqueTypeName(scope.string()),
+			Type: enumType,
+		}
+		g.output.file.Package.AddDecl(enumDecl)
 
-	g.output.declsByName[enumDecl.Name] = &enumDecl
+		g.output.declsByName[enumDecl.Name] = enumDecl
 
-	valueConstant := &codegen.Var{
-		Name:  "enumValues_" + enumDecl.Name,
-		Value: t.Enum,
-	}
-	g.output.file.Package.AddDecl(valueConstant)
+		valueConstant := &codegen.Var{
+			Name:  "enumValues_" + enumDecl.Name,
+			Value: t.Enum,
+		}
+		g.output.file.Package.AddDecl(valueConstant)
 
-	if wrapInStruct {
+		if wrapInStruct {
+			g.output.file.Package.AddImport("encoding/json", "")
+			g.output.file.Package.AddDecl(&codegen.Method{
+				Impl: func(out *codegen.Emitter) {
+					out.Comment("MarshalJSON implements json.Marshaler.")
+					out.Println("func (j *%s) MarshalJSON() ([]byte, error) {", enumDecl.Name)
+					out.Indent(1)
+					out.Println("return json.Marshal(j.Value)")
+					out.Indent(-1)
+					out.Println("}")
+				},
+			})
+		}
+
+		g.output.file.Package.AddImport("fmt", "")
+		g.output.file.Package.AddImport("reflect", "")
 		g.output.file.Package.AddImport("encoding/json", "")
 		g.output.file.Package.AddDecl(&codegen.Method{
 			Impl: func(out *codegen.Emitter) {
-				out.Comment("MarshalJSON implements json.Marshaler.")
-				out.Println("func (j *%s) MarshalJSON() ([]byte, error) {", enumDecl.Name)
+				out.Comment("UnmarshalJSON implements json.Unmarshaler.")
+				out.Println("func (j *%s) UnmarshalJSON(b []byte) error {", enumDecl.Name)
 				out.Indent(1)
-				out.Println("return json.Marshal(j.Value)")
+				out.Print("var v ")
+				enumType.Generate(out)
+				out.Newline()
+				varName := "v"
+				if wrapInStruct {
+					varName += ".Value"
+				}
+				out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }", varName)
+				out.Println("var ok bool")
+				out.Println("for _, expected := range %s {", valueConstant.Name)
+				out.Println("if reflect.DeepEqual(%s, expected) { ok = true; break }", varName)
+				out.Println("}")
+				out.Println("if !ok {")
+				out.Println(`return fmt.Errorf("invalid value (expected one of %%#v): %%#v", %s, %s)`,
+					valueConstant.Name, varName)
+				out.Println("}")
+				out.Println(`*j = %s(v)`, enumDecl.Name)
+				out.Println(`return nil`)
 				out.Indent(-1)
 				out.Println("}")
 			},
 		})
-	}
 
-	g.output.file.Package.AddImport("fmt", "")
-	g.output.file.Package.AddImport("reflect", "")
-	g.output.file.Package.AddImport("encoding/json", "")
-	g.output.file.Package.AddDecl(&codegen.Method{
-		Impl: func(out *codegen.Emitter) {
-			out.Comment("UnmarshalJSON implements json.Unmarshaler.")
-			out.Println("func (j *%s) UnmarshalJSON(b []byte) error {", enumDecl.Name)
-			out.Indent(1)
-			out.Print("var v ")
-			enumType.Generate(out)
-			out.Newline()
-			varName := "v"
-			if wrapInStruct {
-				varName += ".Value"
-			}
-			out.Println("if err := json.Unmarshal(b, &%s); err != nil { return err }", varName)
-			out.Println("var ok bool")
-			out.Println("for _, expected := range %s {", valueConstant.Name)
-			out.Println("if reflect.DeepEqual(%s, expected) { ok = true; break }", varName)
-			out.Println("}")
-			out.Println("if !ok {")
-			out.Println(`return fmt.Errorf("invalid value (expected one of %%#v): %%#v", %s, %s)`,
-				valueConstant.Name, varName)
-			out.Println("}")
-			out.Println(`*j = %s(v)`, enumDecl.Name)
-			out.Println(`return nil`)
-			out.Indent(-1)
-			out.Println("}")
-		},
-	})
-
-	// TODO: May be aliased string type
-	if prim, ok := enumType.(codegen.PrimitiveType); ok && prim.Type == "string" {
-		for _, v := range t.Enum {
-			if s, ok := v.(string); ok {
-				// TODO: Make sure the name is unique across scope
-				g.output.file.Package.AddDecl(&codegen.Constant{
-					Name:  g.makeEnumConstantName(enumDecl.Name, s),
-					Type:  &codegen.NamedType{Decl: &enumDecl},
-					Value: s,
-				})
+		// TODO: May be aliased string type
+		if prim, ok := enumType.(codegen.PrimitiveType); ok && prim.Type == "string" {
+			for _, v := range t.Enum {
+				if s, ok := v.(string); ok {
+					// TODO: Make sure the name is unique across scope
+					g.output.file.Package.AddDecl(&codegen.Constant{
+						Name:  g.makeEnumConstantName(enumDecl.Name, s),
+						Type:  &codegen.NamedType{Decl: g.output.declsByName[enumDecl.Name]},
+						Value: s,
+					})
+				}
 			}
 		}
+	} else {
+		enumDecl = g.output.declsByName[scope.string()]
 	}
 
-	return &codegen.NamedType{Decl: &enumDecl}, nil
+	return &codegen.NamedType{Decl: g.output.declsByName[enumDecl.Name]}, nil
 }
 
 type output struct {
@@ -798,6 +810,13 @@ type output struct {
 	declsByName   map[string]*codegen.TypeDecl
 	declsBySchema map[*schemas.Type]*codegen.TypeDecl
 	warner        func(string)
+}
+
+func (o *output) uniqueTypeDuplicate(name string) bool {
+	if _, ok := o.declsByName[name]; !ok {
+		return false
+	}
+	return true
 }
 
 func (o *output) uniqueTypeName(name string) string {
